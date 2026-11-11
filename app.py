@@ -1,4 +1,6 @@
+import atexit
 import logging
+import time
 import uuid
 from datetime import datetime
 from flask import Flask, render_template, redirect, url_for, flash, request, jsonify, make_response, session
@@ -8,7 +10,8 @@ from forms import SignupForm, LoginForm, ChangePlanForm, BlogPostForm
 from flask_migrate import Migrate
 from flask_login import LoginManager, current_user, login_user, logout_user, login_required
 from flask_wtf.csrf import CSRFProtect
-from posthog import Posthog
+from posthog import Posthog, identify_context
+from posthog.integrations.flask import PosthogFlaskIntegration
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -19,14 +22,128 @@ app.config.from_object(DevelopmentConfig)
 # Initialize CSRF protection
 csrf = CSRFProtect(app)
 
-posthog = Posthog(app.config['PH_PROJECT_KEY'], host=app.config['PH_HOST'])
-posthog.debug = True
+
+class DisabledPosthog:
+    """No-op client used when PostHog is not configured."""
+
+    disabled = True
+
+    def capture(self, *args, **kwargs):
+        return None
+
+    def shutdown(self):
+        return None
+
+
+posthog_key = app.config.get('PH_PROJECT_KEY')
+posthog_host = app.config.get('PH_HOST')
+posthog_log_logger = logging.getLogger('hogflix.posthog_logs')
+posthog_log_logger.setLevel(logging.INFO)
+posthog_log_logger.propagate = False
+
+
+def configure_posthog_log_capture():
+    """Export only HogFlix's purpose-written operational logs to PostHog."""
+    if not posthog_key or not posthog_host:
+        return
+
+    try:
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    except ImportError:
+        if app.debug:
+            app.logger.warning(
+                'PostHog log capture requires opentelemetry-api, opentelemetry-sdk, '
+                'and opentelemetry-exporter-otlp'
+            )
+        return
+
+    logger_provider = LoggerProvider()
+    otlp_exporter = OTLPLogExporter(
+        endpoint=f"{posthog_host.rstrip('/')}/i/v1/logs",
+        headers={"Authorization": f"Bearer {posthog_key}"},
+        timeout=3,
+    )
+    logger_provider.add_log_record_processor(
+        BatchLogRecordProcessor(otlp_exporter, export_timeout_millis=3000)
+    )
+    posthog_log_logger.addHandler(LoggingHandler(logger_provider=logger_provider))
+    atexit.register(logger_provider.shutdown)
+    posthog_log_logger.info(
+        'PostHog log capture configured',
+        extra={'event': 'posthog_log_capture_configured'},
+    )
+
+
+if posthog_key and posthog_host:
+    posthog = Posthog(
+        posthog_key,
+        host=posthog_host,
+        enable_exception_autocapture=True,
+        privacy_mode=False,
+    )
+    PosthogFlaskIntegration(app, client=posthog)
+    atexit.register(posthog.shutdown)
+    configure_posthog_log_capture()
+else:
+    posthog = DisabledPosthog()
+    if app.debug:
+        if not posthog_key:
+            app.logger.warning(
+                'PH_PROJECT_KEY variable required by PostHog is missing or un-configured, '
+                'this causes events to be silently missed. This error stops appearing once '
+                'PH_PROJECT_KEY is configured'
+            )
+        if not posthog_host:
+            app.logger.warning(
+                'PH_HOST variable required by PostHog is missing or un-configured, this '
+                'causes events to be silently missed. This error stops appearing once PH_HOST '
+                'is configured'
+            )
 
 db.init_app(app)
 migrate = Migrate(app, db)
 
 login = LoginManager(app)
 login.login_view = 'login'
+
+
+def bind_posthog_user(user, include_person_properties=False):
+    """Bind the current request's PostHog context to a stable account id."""
+    if getattr(posthog, 'disabled', False):
+        return
+
+    distinct_id = str(user.id)
+    identify_context(distinct_id)
+    if include_person_properties:
+        posthog.set(
+            distinct_id=distinct_id,
+            properties={
+                'email': user.email,
+                'username': user.username,
+                'plan': user.plan,
+                'is_admin': user.is_admin,
+            },
+        )
+
+
+def analytics_distinct_id():
+    """Return the account id or a session-scoped id for anonymous visitors."""
+    if current_user.is_authenticated:
+        return str(current_user.id)
+
+    if 'posthog_anonymous_id' not in session:
+        session['posthog_anonymous_id'] = uuid.uuid4().hex
+    return session['posthog_anonymous_id']
+
+
+@app.before_request
+def bind_authenticated_posthog_user():
+    """Ensure captures and exceptions inherit the authenticated user context."""
+    if current_user.is_authenticated:
+        bind_posthog_user(current_user)
+
 
 # --- LLM Chat setup (enabled when OPENAI_API_KEY is set) ---
 chat_enabled = bool(app.config.get('OPENAI_API_KEY'))
@@ -115,9 +232,9 @@ def signup():
             db.session.add(user)
             db.session.commit()
             app.logger.debug(f"New user created: {user.username} with plan: {user.plan}")
+            bind_posthog_user(user, include_person_properties=True)
             posthog.capture(
                 'user_signed_up',
-                distinct_id=form.email.data,
                 properties={
                     'plan': plan,
                     'date_time': formatted_now()
@@ -129,7 +246,6 @@ def signup():
                 price_dollars = PLAN_PRICES.get(plan, 0)
                 posthog.capture(
                     'subscription_purchased',
-                    distinct_id=form.email.data,
                     properties={
                         'plan': plan,
                         'months': months,
@@ -165,9 +281,9 @@ def login():
             return redirect(url_for('login'))
         
         login_user(user, remember=True)
+        bind_posthog_user(user, include_person_properties=True)
         posthog.capture(
             'user_logged_in',
-            distinct_id=user.email,
             properties={
                 'plan': user.plan,
                 'date_time': formatted_now()
@@ -187,7 +303,6 @@ def logout():
     if current_user.is_authenticated:
         posthog.capture(
             'user_logged_out',
-            distinct_id=current_user.email,
             properties={
                 'date_time': formatted_now()
             }
@@ -201,8 +316,9 @@ def logout():
 @app.route('/search', methods=['POST'])
 def search():
     query = request.form.get('query')
-    distinct_id = current_user.email if current_user.is_authenticated else request.remote_addr or 'anonymous'
-    posthog.capture('search_performed', distinct_id=distinct_id, properties={'query': query})
+    if not current_user.is_authenticated and not getattr(posthog, 'disabled', False):
+        identify_context(analytics_distinct_id())
+    posthog.capture('search_performed', properties={'query_length': len(query or '')})
     return redirect(url_for('search_results', query=query))
 
 @app.route('/search_results')
@@ -220,19 +336,43 @@ def profile():
         new_plan = request.form.get('plan')
         app.logger.debug(f"Plan to update: {new_plan}")
         if new_plan in ['Free', 'Premium', 'Max-imal']:
+            previous_plan = current_user.plan
             current_user.plan = new_plan
             try:
                 db.session.commit()
-                app.logger.debug(f"User plan updated to: {new_plan}")
-                flash('Your subscription plan has been updated!')
-                if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-                    return jsonify({'success': True})
             except Exception as e:
                 db.session.rollback()
                 app.logger.error(f"Error updating plan: {e}")
                 flash('An error occurred while updating your plan. Please try again.', 'danger')
                 if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
                     return jsonify({'success': False})
+            else:
+                try:
+                    posthog.set(
+                        distinct_id=str(current_user.id),
+                        properties={'plan': new_plan},
+                    )
+                    posthog.capture(
+                        'subscription_plan_changed',
+                        properties={
+                            'previous_plan': previous_plan,
+                            'new_plan': new_plan,
+                        },
+                    )
+                except Exception:
+                    app.logger.exception('Failed to capture subscription_plan_changed')
+                posthog_log_logger.info(
+                    'Subscription plan updated',
+                    extra={
+                        'event': 'subscription_plan_updated',
+                        'previous_plan': previous_plan,
+                        'new_plan': new_plan,
+                    },
+                )
+                app.logger.debug(f"User plan updated to: {new_plan}")
+                flash('Your subscription plan has been updated!')
+                if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+                    return jsonify({'success': True})
         else:
             flash('Please select a valid plan.', 'danger')
             if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
@@ -275,6 +415,13 @@ def delete_post(post_id):
     post = BlogPost.query.get_or_404(post_id)
     db.session.delete(post)
     db.session.commit()
+    try:
+        posthog.capture(
+            'blog_post_deleted',
+            properties={'post_id': post_id},
+        )
+    except Exception:
+        app.logger.exception('Failed to capture blog_post_deleted')
     return jsonify({'success': True})
 
 @app.route('/create_post', methods=['GET', 'POST'])
@@ -285,6 +432,17 @@ def create_post():
         post = BlogPost(title=form.title.data, content=form.content.data)
         db.session.add(post)
         db.session.commit()
+        try:
+            posthog.capture(
+                'blog_post_created',
+                properties={'post_id': post.id},
+            )
+        except Exception:
+            app.logger.exception('Failed to capture blog_post_created')
+        posthog_log_logger.info(
+            'Blog post created',
+            extra={'event': 'blog_post_created', 'post_id': post.id},
+        )
         flash('Blog post created successfully!', 'success')
         return redirect(url_for('blog'))
     return render_template('create_post.html', form=form)
@@ -325,10 +483,13 @@ def chat_api():
         session['conversation_id'] = uuid.uuid4().hex
     conversation_id = session['conversation_id']
 
-    distinct_id = current_user.email if current_user.is_authenticated else request.remote_addr or 'anonymous'
+    distinct_id = analytics_distinct_id()
+    if not getattr(posthog, 'disabled', False):
+        identify_context(distinct_id)
 
     try:
         ai_text = None
+        turn_id = uuid.uuid4().hex
         if 'history' not in session:
             session['history'] = []
 
@@ -360,11 +521,17 @@ def chat_api():
                 callback_handler = CallbackHandler(
                     client=posthog,
                     distinct_id=distinct_id,
-                    trace_id=conversation_id,
-                    properties={"conversation_id": conversation_id},
+                    trace_id=turn_id,
+                    properties={"$ai_session_id": conversation_id},
+                    privacy_mode=False,
                 )
-                result = model.invoke(lc_messages, config={"callbacks": [callback_handler]})
             except Exception:
+                callback_handler = None
+                app.logger.exception('Failed to configure PostHog LangChain callback')
+
+            if callback_handler:
+                result = model.invoke(lc_messages, config={"callbacks": [callback_handler]})
+            else:
                 result = model.invoke(lc_messages)
 
             ai_text = getattr(result, 'content', None) or str(result)
@@ -372,23 +539,41 @@ def chat_api():
             if openai_client is None:
                 return jsonify({ 'error': 'Chat disabled' }), 400
             # Fallback to direct OpenAI client
+            generation_started_at = time.monotonic()
+            input_tokens = None
+            output_tokens = None
+            posthog_ai_kwargs = (
+                {
+                    "posthog_distinct_id": distinct_id,
+                    "posthog_trace_id": turn_id,
+                    "posthog_properties": {"$ai_session_id": conversation_id},
+                }
+                if openai_instrumented else {}
+            )
             if hasattr(openai_client, 'responses'):
                 resp = openai_client.responses.create(
                     model="gpt-4o-mini",
                     input=[{"role": "user", "content": user_message}],
-                    **({"posthog_distinct_id": distinct_id} if openai_instrumented else {})
+                    **posthog_ai_kwargs,
                 )
                 try:
                     ai_text = resp.output_text
                 except Exception:
                     choice = getattr(resp, 'choices', [{}])[0] if hasattr(resp, 'choices') else None
                     ai_text = (choice.get('message', {}) or {}).get('content') if isinstance(choice, dict) else None
+                usage = getattr(resp, 'usage', None)
+                input_tokens = getattr(usage, 'input_tokens', None)
+                output_tokens = getattr(usage, 'output_tokens', None)
             else:
                 completion = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role": "user", "content": user_message}],
+                    **posthog_ai_kwargs,
                 )
                 ai_text = completion.choices[0].message.content
+                usage = getattr(completion, 'usage', None)
+                input_tokens = getattr(usage, 'prompt_tokens', None)
+                output_tokens = getattr(usage, 'completion_tokens', None)
 
         if not ai_text:
             ai_text = "(no response)"
@@ -397,22 +582,36 @@ def chat_api():
         session['history'].append({"role": "user", "content": user_message})
         session['history'].append({"role": "assistant", "content": ai_text})
 
-        # Capture a basic generation event for visibility even without wrapper
-        try:
-            posthog.capture(
-                '$ai_generation',
-                distinct_id=distinct_id,
-                properties={
-                    '$ai_model': 'gpt-4o-mini',
-                    '$ai_provider': 'openai',
-                    '$ai_input': user_message,
-                    '$ai_output': ai_text,
-                    '$ai_trace_id': conversation_id,
-                }
-            )
-        except Exception:
-            app.logger.exception('Failed to capture $ai_generation')
+        # Only the raw-client fallback needs an explicit generation event.
+        if not langchain_available and not openai_instrumented:
+            try:
+                posthog.capture(
+                    '$ai_generation',
+                    distinct_id=distinct_id,
+                    properties={
+                        '$ai_model': 'gpt-4o-mini',
+                        '$ai_provider': 'openai',
+                        '$ai_trace_id': turn_id,
+                        '$ai_session_id': conversation_id,
+                        '$ai_input': [{'role': 'user', 'content': user_message}],
+                        '$ai_output_choices': [{'role': 'assistant', 'content': ai_text}],
+                        '$ai_input_tokens': input_tokens,
+                        '$ai_output_tokens': output_tokens,
+                        '$ai_latency': time.monotonic() - generation_started_at,
+                    },
+                )
+            except Exception:
+                app.logger.exception('Failed to capture $ai_generation')
 
+        posthog_log_logger.info(
+            'Chat response generated',
+            extra={
+                'event': 'chat_response_generated',
+                'input_length': len(user_message),
+                'output_length': len(ai_text),
+                'chat_implementation': 'langchain' if langchain_available else 'openai',
+            },
+        )
         return jsonify({ 'message': ai_text })
     except Exception as e:
         app.logger.exception('Chat API error')

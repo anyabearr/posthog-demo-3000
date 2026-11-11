@@ -9,8 +9,8 @@ class Config:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SECRET_KEY = os.urandom(24)
     WTF_CSRF_ENABLED = True
-    PH_PROJECT_KEY = os.getenv('PH_PROJECT_KEY', '')
-    PH_HOST = os.getenv('PH_HOST', 'https://us.i.posthog.com')
+    PH_PROJECT_KEY = os.getenv('PH_PROJECT_KEY')
+    PH_HOST = os.getenv('PH_HOST')
     APP_HOST = os.getenv('APP_HOST', 'http://localhost')
     APP_PORT = os.getenv('APP_PORT', 5000)
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
