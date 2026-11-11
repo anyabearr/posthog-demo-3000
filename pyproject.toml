@@ -3,7 +3,7 @@ name = "hogflix-demo"
 version = "1.0.0"
 description = "HogFlix Demo 3000 - A PostHog demo application"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "alembic>=1.13.2",
     "backoff>=2.2.1",
@@ -22,7 +22,10 @@ dependencies = [
     "langchain-community>=0.2.12",
     "langchain-openai>=0.1.22",
     "openai>=1.40.0",
-    "posthog>=3.5.0",
+    "opentelemetry-api>=1.45.2",
+    "opentelemetry-exporter-otlp>=1.45.2",
+    "opentelemetry-sdk>=1.45.2",
+    "posthog>=7.69.0",
     "pymysql>=1.1.1",
     "python-dotenv>=1.0.1",
     "requests>=2.31.0",
